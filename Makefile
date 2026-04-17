@@ -27,6 +27,12 @@ $(BUILDDIR)/%.o: %.cpp $(DEPDIR)/%.d | $(DEPDIR) $(BUILDDIR)
 $(BUILDDIR)/%.so: $(BUILDDIR)/%.o
 	$(CXX) -shared $^ -o $@ $(LDFLAGS)
 
+tests/%-test.bc: tests/src/%-test.c
+	$(CXX) -fno-discard-value-names -Xclang -disable-O0-optnone -emit-llvm -c $< -o $@
+
+tests/%-test-m2r.bc: tests/%-test.bc
+	opt -bugpoint-enable-legacy-pm=1 -mem2reg $< -o $@
+
 $(BUILDDIR)/tests/%-opt.bc: tests/%-test-m2r.bc $(OPTIMIZER_LIBS) | $(BUILDDIR)/tests
 	opt -bugpoint-enable-legacy-pm=1 $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) -passes='$*' $< -o $@
 

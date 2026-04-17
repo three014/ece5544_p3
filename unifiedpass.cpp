@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,24 @@
 using namespace llvm;
 
 namespace {
+
+BitVector meet_union(const std::span<const BitVector> in_or_outs) {
+  if (in_or_outs.empty())
+    return {};
+  BitVector output = in_or_outs[0];
+  for (size_t i = 1; i < in_or_outs.size(); ++i)
+    output |= in_or_outs[i];
+  return output;
+}
+
+BitVector meet_intersect(const std::span<const BitVector> in_or_outs) {
+  if (in_or_outs.empty())
+    return {};
+  BitVector output = in_or_outs[0];
+  for (size_t i = 1; i < in_or_outs.size(); ++i)
+    output &= in_or_outs[i];
+  return output;
+}
 
 std::string getShortValueName(const Value *V) {
   if (!V)
@@ -156,12 +175,7 @@ struct AvailablePass : PassInfoMixin<AvailablePass> {
   }
 
   static BitVector meet(const std::vector<BitVector> &outs) {
-    if (outs.empty())
-      return {};
-    BitVector in = outs[0];
-    for (size_t i = 1; i < outs.size(); ++i)
-      in &= outs[i];
-    return in;
+    return meet_intersect(outs);
   }
 
   static BitVector transfer(const BitVector &in, const BitVector &gen,
@@ -271,14 +285,7 @@ struct LivenessPass : PassInfoMixin<LivenessPass> {
 
   // Meet: OUT[B] = union IN[S], S all successors of B
   static BitVector meet(const std::vector<BitVector> &ins) {
-    if (ins.empty()) {
-      return {};
-    }
-    BitVector out = ins[0];
-    for (size_t i = 1; i < ins.size(); i++) {
-      out |= ins[i];
-    }
-    return out;
+    return meet_union(ins);
   }
 
   // Transfer: IN[B] = USE[B] union (OUT[B] - DEF[B])
@@ -407,12 +414,7 @@ struct ReachingPass : PassInfoMixin<ReachingPass> {
 
   // Meet: union -- a definition reaches if it arrives via ANY predecessor path.
   static BitVector meet(const std::vector<BitVector> &ins) {
-    if (ins.empty())
-      return {};
-    BitVector out = ins[0];
-    for (size_t i = 1; i < ins.size(); ++i)
-      out |= ins[i];
-    return out;
+    return meet_union(ins);
   }
 
   // Transfer: OUT = gen union (IN - KILL)
