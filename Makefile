@@ -5,7 +5,7 @@ BUILDDIR     = build
 DEPDIR       = $(BUILDDIR)/.deps
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
 
-TESTS             = available constantprop liveness reaching
+TESTS             = available constantprop liveness reaching dce dominators licm
 OPTIMIZER_SOURCES = unifiedpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 TESTS_PRE         = $(TESTS:%=$(BUILDDIR)/tests/%-m2r.ll)
