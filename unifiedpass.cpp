@@ -1,9 +1,11 @@
-// ECE/CS 5544 Assignment 2 starter unifiedpass.cpp
-// Lean starter: buildable scaffolds, minimal solved logic.
+// ECE/CS 5544 Assignment 3 unifiedpass.cpp
 
+#include "llvm/IR/InstrTypes.h"
 #include <algorithm>
+#include <compare>
+#include <concepts>
 #include <cstdint>
-#include <span>
+#include <ranges>
 #include <string>
 #include <vector>
 
@@ -16,6 +18,7 @@
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/Pass.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/raw_ostream.h>
@@ -24,22 +27,121 @@ using namespace llvm;
 
 namespace {
 
-BitVector meet_union(const std::span<const BitVector> in_or_outs) {
-  if (in_or_outs.empty())
-    return {};
-  BitVector output = in_or_outs[0];
-  for (size_t i = 1; i < in_or_outs.size(); ++i)
-    output |= in_or_outs[i];
+// Concept for constraining the type of a range.
+// For example, `range_of<Value *>` is a forward iterator of `Value *`.
+// `std::vector<T>` should be 100% compatible with this concept.
+template <typename U, typename T>
+concept range_of =
+    std::ranges::range<U> && std::same_as<std::ranges::range_value_t<U>, T>;
+
+template <typename T>
+void printBitSet(raw_ostream &OS, StringRef label, const BitVector &bits,
+                 const std::vector<T> &universe) {
+  OS << "  " << label << ": { ";
+  bool first = true;
+  for (unsigned i = 0; i < bits.size(); ++i) {
+    if (!bits.test(i))
+      continue;
+    if (!first)
+      OS << "; ";
+    first = false;
+    OS << universe[i];
+  }
+  OS << " }\n";
+}
+
+void printBitSet(raw_ostream &OS, StringRef label, const BitVector &bits,
+                 const std::vector<Value *> universe) {
+  OS << "  " << label << ": { ";
+  bool first = true;
+  for (unsigned i = 0; i < bits.size(); ++i) {
+    if (!bits.test(i))
+      continue;
+    if (!first)
+      OS << "; ";
+    first = false;
+    universe[i]->printAsOperand(OS, false);
+  }
+  OS << " }\n";
+}
+
+void printBitSet(raw_ostream &OS, StringRef label, const BitVector &bits,
+                 const std::vector<BasicBlock *> universe) {
+  OS << "  " << label << ": { ";
+  bool first = true;
+  for (unsigned i = 0; i < bits.size(); ++i) {
+    if (!bits.test(i))
+      continue;
+    if (!first)
+      OS << "; ";
+    first = false;
+    OS << universe[i]->getName();
+  }
+  OS << " }\n";
+}
+
+BitVector meet_union(const range_of<BitVector> auto in_or_outs,
+                     size_t universe_size) {
+  BitVector output(universe_size);
+  for (const auto &first : in_or_outs | std::views::take(1))
+    output = first;
+  for (const auto &bv : in_or_outs | std::views::drop(1))
+    output |= bv;
   return output;
 }
 
-BitVector meet_intersect(const std::span<const BitVector> in_or_outs) {
-  if (in_or_outs.empty())
-    return {};
-  BitVector output = in_or_outs[0];
-  for (size_t i = 1; i < in_or_outs.size(); ++i)
-    output &= in_or_outs[i];
+BitVector meet_intersect(const range_of<BitVector> auto in_or_outs,
+                         size_t universe_size) {
+  BitVector output(universe_size);
+  for (const auto &first : in_or_outs | std::views::take(1))
+    output = first;
+  for (const auto &next : in_or_outs | std::views::drop(1))
+    output &= next;
   return output;
+}
+
+template <std::three_way_comparable T> void sort_unique(std::vector<T> &v) {
+  std::ranges::sort(v);
+  const auto [begin, end] = std::ranges::unique(v);
+  v.erase(begin, end);
+}
+
+const std::vector<BasicBlock *> r_post_order(Function &F) {
+  // Create a forward ordering of basic blocks, where:
+  // - Successors to a basic block will go after that block
+  //   if it hasn't been seen already
+  // - Direct children of a basic block don't neccessarily have
+  //   an ordering among themselves.
+  std::vector<BasicBlock *> order;
+  order.push_back(&F.getEntryBlock());
+  for (size_t i = 0; i < order.size(); ++i)
+    for (BasicBlock *succ : successors(order[i])) {
+      auto x = std::ranges::find(order, succ);
+      if (std::ranges::find(order, succ) == order.end())
+        order.push_back(succ);
+    }
+  return order;
+}
+
+const std::vector<BasicBlock *> post_order(Function &F) {
+  // Create a backwards ordering of basic blocks.
+  std::vector<BasicBlock *> order;
+  for (BasicBlock &BB : F) {
+    // Rationale: BBs that lead outside the function
+    // won't have any successors, so they'll have an
+    // empty list, and that's where we'll want to start.
+    if (successors(&BB).empty())
+      order.push_back(&BB);
+  }
+
+  // Find predecessors of the blocks in the list, and add
+  // them to the list if they're not already there.
+  for (size_t i = 0; i < order.size(); ++i)
+    for (BasicBlock *pred : predecessors(order[i]))
+      if (std::ranges::find(order, pred) == order.end())
+        order.push_back(pred);
+
+  return order;
 }
 
 std::string getShortValueName(const Value *V) {
@@ -54,6 +156,119 @@ std::string getShortValueName(const Value *V) {
   V->printAsOperand(OS, false);
   return S;
 }
+
+template <std::three_way_comparable T>
+static void set_if_exists(range_of<T> auto universe, BitVector &bitset,
+                          T value) {
+  const auto it = std::ranges::find(universe, value);
+  if (it != universe.cend() && *it == value)
+    bitset.set(it - universe.cbegin());
+}
+
+// -------------------- Faint Analysis ---------------------------
+
+struct FaintPass : FunctionPass {
+  static char ID;
+  FaintPass() : FunctionPass(ID) {}
+
+  struct BlockState {
+    BitVector in, out;
+  };
+
+  DenseMap<BasicBlock *, BlockState> st;
+
+  // LHS variables
+  std::vector<Value *> universe;
+
+  BitVector gen(Instruction &I) {
+    BitVector gen(universe.size());
+    const auto values = I.operand_values();
+    const bool is_assignment = isa<BinaryOperator>(&I);
+    const bool is_lhs_used_in_def =
+        std::ranges::find(values, &I) != values.end();
+    if (is_assignment && !is_lhs_used_in_def)
+      set_if_exists(universe, gen, dyn_cast<Value>(&I));
+    return gen;
+  }
+
+  BitVector const_kill(Instruction &I) {
+    BitVector kill(universe.size());
+    const bool is_assignment = isa<BinaryOperator>(&I);
+    if (is_assignment)
+      for (Value *V : I.operand_values())
+        set_if_exists(universe, kill, V);
+    return kill;
+  }
+
+  BitVector dep_kill(Instruction &I, const BitVector &out) {
+    BitVector kill(universe.size());
+    const BitVector &faint = out;
+    const bool is_assignment = isa<BinaryOperator>(&I);
+    const bool is_lhs_faint = [&]() {
+      const auto it = std::ranges::find(universe, &I);
+      if (it != universe.cend()) {
+        size_t idx = it - universe.cbegin();
+        return faint.size() > idx && faint[idx];
+      }
+      return false;
+    }();
+
+    if (is_assignment && is_lhs_faint)
+      for (Value *V : I.operand_values())
+        set_if_exists(universe, kill, V);
+
+    return kill;
+  }
+
+  // OUT -> IN
+  BitVector transfer(Instruction &I, const BitVector &out) {
+    BitVector in = out;
+    BitVector _gen = gen(I);
+    BitVector _kill = const_kill(I) |= dep_kill(I, out);
+    return in.reset(_kill) |= _gen;
+  }
+
+  BitVector transfer(BasicBlock &BB, const BitVector &out) {
+    BitVector in = out;
+    for (Instruction &I : *BB.getReverseIterator()) {
+      BitVector &out = in;
+      in = transfer(I, out);
+    }
+    return in;
+  }
+
+  bool runOnFunction(Function &F) {
+    auto to_value = [](Instruction &I) { return cast<Value>(&I); };
+    auto lhs = F | std::views::join | std::views::transform(to_value);
+    universe.assign(lhs.begin(), lhs.end());
+    sort_unique(universe);
+
+    const std::vector<BasicBlock *> order = post_order(F);
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (BasicBlock *BB : order) {
+        std::vector<BitVector> succIns;
+        for (BasicBlock *succ : successors(BB))
+          succIns.push_back(st[succ].in);
+
+        if (succIns.empty())
+          succIns.push_back(BitVector(universe.size(), true)); // = T
+
+        st[BB].out = meet_intersect(succIns, universe.size());
+        BitVector in = transfer(*BB, st[BB].out);
+        if (in != st[BB].in) {
+          changed = true;
+          st[BB].in = in;
+        }
+      }
+    }
+    return false;
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) { AU.setPreservesAll(); }
+};
 
 // -------------------- Available Expressions --------------------
 
@@ -92,37 +307,6 @@ raw_ostream &operator<<(raw_ostream &OS, const Expr &E) {
   return OS;
 }
 
-template <typename T>
-void printBitSet(raw_ostream &OS, StringRef label, const BitVector &bits,
-                 const std::vector<T> &universe) {
-  OS << "  " << label << ": { ";
-  bool first = true;
-  for (unsigned i = 0; i < bits.size(); ++i) {
-    if (!bits.test(i))
-      continue;
-    if (!first)
-      OS << "; ";
-    first = false;
-    OS << universe[i];
-  }
-  OS << " }\n";
-}
-
-void printBitSet(raw_ostream &OS, StringRef label, const BitVector &bits,
-                 const std::vector<Value *> universe) {
-  OS << "  " << label << ": { ";
-  bool first = true;
-  for (unsigned i = 0; i < bits.size(); ++i) {
-    if (!bits.test(i))
-      continue;
-    if (!first)
-      OS << "; ";
-    first = false;
-    universe[i]->printAsOperand(OS, false);
-  }
-  OS << " }\n";
-}
-
 struct AvailablePass : PassInfoMixin<AvailablePass> {
   struct BlockState {
     BitVector in;
@@ -130,6 +314,8 @@ struct AvailablePass : PassInfoMixin<AvailablePass> {
     BitVector gen;
     BitVector kill;
   };
+
+  std::vector<Expr> universe;
 
   static BitVector top(const std::vector<Expr> &universe) {
     return BitVector(universe.size(), true);
@@ -174,12 +360,12 @@ struct AvailablePass : PassInfoMixin<AvailablePass> {
     return kill;
   }
 
-  static BitVector meet(const std::vector<BitVector> &outs) {
-    return meet_intersect(outs);
+  BitVector meet(const std::vector<BitVector> &outs) {
+    return meet_intersect(outs, universe.size());
   }
 
-  static BitVector transfer(const BitVector &in, const BitVector &gen,
-                            const BitVector &kill) {
+  BitVector transfer(const BitVector &in, const BitVector &gen,
+                     const BitVector &kill) {
     BitVector out = in;
     out.reset(kill);
     out |= gen;
@@ -192,18 +378,16 @@ struct AvailablePass : PassInfoMixin<AvailablePass> {
     outs() << " ===\n";
 
     // Create universal set of expressions from function F
-    std::vector<Expr> universe;
-    for (auto &BB : F) {
-      for (auto &I : BB) {
-        if (auto *BO = dyn_cast<BinaryOperator>(&I))
-          universe.push_back(Expr::fromBO(*BO));
-      }
-    }
+    auto isa_bo = [](auto &I) { return isa<BinaryOperator>(&I); };
+    auto into_expr = [](auto &I) {
+      return Expr::fromBO(*cast<BinaryOperator>(&I));
+    };
+    auto exprs = F | std::views::join | std::views::filter(isa_bo) |
+                 std::views::transform(into_expr);
+    universe.assign(exprs.begin(), exprs.end());
 
     // Remove redundant expressions
-    std::sort(universe.begin(), universe.end());
-    universe.erase(std::unique(universe.begin(), universe.end()),
-                   universe.end());
+    sort_unique(universe);
 
     // Create a forward ordering of basic blocks, where:
     // - Successors to a basic block will go after that block
@@ -275,6 +459,9 @@ struct LivenessPass : PassInfoMixin<LivenessPass> {
     BitVector def;
   };
 
+  DenseMap<const BasicBlock *, BlockState> st;
+  std::vector<Value *> universe;
+
   static BitVector top(const std::vector<Value *> &domain) {
     return BitVector(domain.size(), true);
   }
@@ -284,8 +471,8 @@ struct LivenessPass : PassInfoMixin<LivenessPass> {
   }
 
   // Meet: OUT[B] = union IN[S], S all successors of B
-  static BitVector meet(const std::vector<BitVector> &ins) {
-    return meet_union(ins);
+  BitVector meet(const std::vector<BitVector> &ins) {
+    return meet_union(ins, universe.size());
   }
 
   // Transfer: IN[B] = USE[B] union (OUT[B] - DEF[B])
@@ -306,24 +493,23 @@ struct LivenessPass : PassInfoMixin<LivenessPass> {
 
     // Domain: Set of variables in function F,
     // including the variables as operands.
-    std::vector<Value *> universe;
+    std::vector<Value *> tmp;
     for (auto &BB : F) {
       for (auto &I : BB) {
         if (!I.getType()->isVoidTy()) {
-          universe.push_back(&I);
+          tmp.push_back(&I);
           for (auto *V : I.operand_values()) {
             if (!isa<ConstantData>(V) && !V->getType()->isVoidTy()) {
-              universe.push_back(V);
+              tmp.push_back(V);
             }
           }
         }
       }
     }
+    universe.assign(tmp.begin(), tmp.end());
 
     // Remove redundant expressions
-    std::sort(universe.begin(), universe.end());
-    universe.erase(std::unique(universe.begin(), universe.end()),
-                   universe.end());
+    sort_unique(tmp);
 
     std::vector<const BasicBlock *> order;
     for (const BasicBlock &BB : F) {
@@ -346,26 +532,25 @@ struct LivenessPass : PassInfoMixin<LivenessPass> {
     }
 
     // Intialize state
-    DenseMap<const BasicBlock *, BlockState> st;
     for (const BasicBlock *BB : order) {
       BlockState bs;
-      bs.in = bottom(universe);
-      bs.def = bottom(universe);
-      bs.out = bottom(universe);
-      bs.use = bottom(universe);
+      bs.in = bottom(tmp);
+      bs.def = bottom(tmp);
+      bs.out = bottom(tmp);
+      bs.use = bottom(tmp);
       for (const Instruction &I : *BB) {
         for (const auto *V : I.operand_values()) {
-          const auto it = std::find(universe.cbegin(), universe.cend(), V);
-          if (it != universe.cend()) {
-            bool def = bs.def[it - universe.cbegin()];
-            bool use = bs.use[it - universe.cbegin()];
-            bs.use[it - universe.cbegin()] = !def || use;
+          const auto it = std::find(tmp.cbegin(), tmp.cend(), V);
+          if (it != tmp.cend()) {
+            bool def = bs.def[it - tmp.cbegin()];
+            bool use = bs.use[it - tmp.cbegin()];
+            bs.use[it - tmp.cbegin()] = !def || use;
           }
         }
 
-        auto it = std::find(universe.cbegin(), universe.cend(), &I);
-        if (it != universe.cend()) {
-          bs.def.set(it - universe.begin());
+        auto it = std::find(tmp.cbegin(), tmp.cend(), &I);
+        if (it != tmp.cend()) {
+          bs.def.set(it - tmp.begin());
         }
       }
       st[BB] = bs;
@@ -380,7 +565,7 @@ struct LivenessPass : PassInfoMixin<LivenessPass> {
           succIns.push_back(st[succ].in);
         }
         if (succIns.empty()) {
-          succIns.push_back(bottom(universe));
+          succIns.push_back(bottom(tmp));
         }
 
         st[BB].out = meet(succIns);
@@ -396,10 +581,10 @@ struct LivenessPass : PassInfoMixin<LivenessPass> {
       outs() << "BB: ";
       BB->printAsOperand(outs(), false);
       outs() << "\n";
-      printBitSet(outs(), "use", st[BB].use, universe);
-      printBitSet(outs(), "def", st[BB].def, universe);
-      printBitSet(outs(), "IN", st[BB].in, universe);
-      printBitSet(outs(), "OUT", st[BB].out, universe);
+      printBitSet(outs(), "use", st[BB].use, tmp);
+      printBitSet(outs(), "def", st[BB].def, tmp);
+      printBitSet(outs(), "IN", st[BB].in, tmp);
+      printBitSet(outs(), "OUT", st[BB].out, tmp);
     }
     return PreservedAnalyses::all();
   }
@@ -413,8 +598,9 @@ struct ReachingPass : PassInfoMixin<ReachingPass> {
   };
 
   // Meet: union -- a definition reaches if it arrives via ANY predecessor path.
-  static BitVector meet(const std::vector<BitVector> &ins) {
-    return meet_union(ins);
+  static BitVector meet(const std::vector<BitVector> &ins,
+                        size_t universe_size) {
+    return meet_union(ins, universe_size);
   }
 
   // Transfer: OUT = gen union (IN - KILL)
@@ -477,7 +663,7 @@ struct ReachingPass : PassInfoMixin<ReachingPass> {
         if (predOuts.empty())
           predOuts.push_back(BitVector(universe.size(), false));
 
-        st[BB].in = meet(predOuts);
+        st[BB].in = meet(predOuts, universe.size());
         BitVector newOut = transfer(st[BB].in, st[BB].gen, st[BB].kill);
         if (newOut != st[BB].out) {
           st[BB].out = newOut;
@@ -749,14 +935,125 @@ struct ConstantPropPass : PassInfoMixin<ConstantPropPass> {
   }
 };
 
+/**
+ * Dominators as a Data Flow Analysis problem:
+ *
+ * Direction: forward
+ * Values: basic blocks
+ * Meet: intersect
+ * Top (T): all basic blocks
+ * Bottom: {}
+ * Boundary cond for entry node: OUT[entry] = {entry}
+ * Init for internal nodes: OUT[B] = T
+ * Transfer: OUT[B] = IN[B] union B
+ */
+struct DominatorsPass : FunctionPass {
+  static char ID;
+  DominatorsPass() : FunctionPass(ID) {}
+
+  struct BlockState {
+    BitVector in, out;
+  };
+
+  BitVector top(size_t size) { return BitVector(size, true); }
+
+  bool runOnFunction(Function &F) {
+    outs() << "=== ";
+    F.printAsOperand(outs(), false);
+    outs() << " ===\n";
+
+    auto get_ptr = [](BasicBlock &BB) { return &BB; };
+    auto blocks = F | std::views::transform(get_ptr);
+    std::vector<BasicBlock *> universe{blocks.begin(), blocks.end()};
+    sort_unique(universe);
+
+    const std::vector<BasicBlock *> order = r_post_order(F);
+
+    DenseMap<BasicBlock *, BlockState> st;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (BasicBlock *BB : order) {
+        std::vector<BitVector> predOuts;
+        if (BB == &F.getEntryBlock()) {
+          BitVector boundary = BitVector(universe.size());
+          boundary.set(0); // OUT[B] = {entry}
+          predOuts.push_back(boundary);
+        }
+        for (BasicBlock *pred : predecessors(BB))
+          predOuts.push_back(st[pred].out);
+        if (predOuts.empty())
+          predOuts.push_back(top(universe.size()));
+
+        st[BB].in = meet_intersect(predOuts, universe.size());
+
+        // Transfer
+        BitVector newOut = st[BB].in;
+        auto it = std::ranges::find(universe, BB);
+        if (it != universe.end() && *it == BB)
+          newOut.set(it - universe.begin());
+
+        if (newOut != st[BB].out) {
+          st[BB].out = newOut;
+          changed = true;
+        }
+      }
+    }
+
+    for (BasicBlock *BB : order) {
+      BB->printAsOperand(outs(), false);
+      auto &out = st[BB].out;
+      if (out.empty())
+        outs() << " has no dominators\n";
+
+      outs() << " is dominated by " << universe[0]->getName();
+      for (size_t i = 1; i < out.size(); ++i) {
+        if (!out[i])
+          continue;
+        outs() << ", " << universe[i]->getName();
+      }
+
+      outs() << ".\n";
+    }
+
+    return false;
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const { AU.setPreservesAll(); }
+};
+
+struct DeadCodeEliminationPass : FunctionPass {
+  static char ID;
+
+  DeadCodeEliminationPass() : FunctionPass(ID) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const { AU.setPreservesCFG(); }
+
+  bool runOnFunction(Function &F) { return false; }
+};
+
 } // namespace
 
+char DominatorsPass::ID = 0;
+static RegisterPass<DominatorsPass> tmp1("dominators", "Dominators", false,
+                                         true);
+
+char FaintPass::ID = 1;
+static RegisterPass<FaintPass> tmp2("faint", "Faint Analysis", false, true);
+
+char DeadCodeEliminationPass::ID = 2;
+static RegisterPass<DeadCodeEliminationPass>
+    tmp3("dead-code-elimination", "Dead Code Elimination", false, false);
+
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "UnifiedPass", "v0.3-starter",
-          [](PassBuilder &PB) {
+  return {LLVM_PLUGIN_API_VERSION, "UnifiedPass", "v0.4", [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM,
                    ArrayRef<PassBuilder::PipelineElement>) -> bool {
+                  if (Name == "dominators") {
+                    FPM.addPass(DominatorsPass());
+                    return true;
+                  }
                   if (Name == "available") {
                     FPM.addPass(AvailablePass());
                     return true;
