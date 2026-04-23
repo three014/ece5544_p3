@@ -1,3 +1,6 @@
 .cache/
 compile_commands.json
-build/
+*.so
+*.ll*
+*.bc*
+*:Zone.Identifier

@@ -1,6 +1,5 @@
 // ECE/CS 5544 Assignment 3 unifiedpass.cpp
 
-#include "llvm/IR/InstrTypes.h"
 #include <algorithm>
 #include <compare>
 #include <concepts>
@@ -10,12 +9,15 @@
 
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/Analysis/LoopInfo.h>
+#include <llvm/IR/Analysis.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Pass.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -25,14 +27,29 @@
 using namespace llvm;
 
 namespace {
+namespace r = std::ranges;
+namespace rv = std::ranges::views;
 
 // Concept for constraining the type of a range.
-// For example, `range_of<Value *>` is a forward iterator of `Value *`.
+// For example, `range_of<Value *>` is a sized/random access iterator
+// of `Value *`.
 // `std::vector<T>` should be 100% compatible with this concept.
 template <typename U, typename T>
-concept range_of =
-    std::ranges::sized_range<U> && std::ranges::random_access_range<U> &&
-    std::same_as<std::ranges::range_value_t<U>, T>;
+concept sized_random_access_range_of =
+    r::sized_range<U> && r::random_access_range<U> &&
+    std::same_as<r::range_value_t<U>, T>;
+
+static std::string getBBName(BasicBlock *BB) {
+  if (!BB)
+    return "null";
+  if (!BB->getName().empty())
+    return BB->getName().str();
+
+  std::string s;
+  raw_string_ostream os(s);
+  BB->printAsOperand(os, false);
+  return os.str();
+}
 
 template <typename T>
 void printBitSet(raw_ostream &OS, StringRef label, const BitVector &bits,
@@ -82,8 +99,8 @@ void printBitSet(raw_ostream &OS, StringRef label, const BitVector &bits,
 
 // Sorts the vector in ascending order and then removes duplicate values.
 template <std::three_way_comparable T> void sort_unique(std::vector<T> &v) {
-  std::ranges::sort(v);
-  const auto [begin, end] = std::ranges::unique(v);
+  r::sort(v);
+  const auto [begin, end] = r::unique(v);
   v.erase(begin, end);
 }
 
@@ -97,8 +114,7 @@ static const std::vector<BasicBlock *> r_post_order(Function &F) {
   order.push_back(&F.getEntryBlock());
   for (size_t i = 0; i < order.size(); ++i)
     for (BasicBlock *succ : successors(order[i])) {
-      auto x = std::ranges::find(order, succ);
-      if (std::ranges::find(order, succ) == order.end())
+      if (r::find(order, succ) == order.end())
         order.push_back(succ);
     }
   return order;
@@ -119,7 +135,7 @@ static const std::vector<BasicBlock *> post_order(Function &F) {
   // them to the list if they're not already there.
   for (size_t i = 0; i < order.size(); ++i)
     for (BasicBlock *pred : predecessors(order[i]))
-      if (std::ranges::find(order, pred) == order.end())
+      if (r::find(order, pred) == order.end())
         order.push_back(pred);
 
   return order;
@@ -138,129 +154,200 @@ std::string getShortValueName(const Value *V) {
   return S;
 }
 
-template <std::three_way_comparable T, range_of<T> R> struct BitSetHelper {
-  R &universe;
+// Helper struct for representing values as booleans in a bitset.
+// To use, create a new struct that inherits this struct
+// and add your own methods that need access to the universe.
+template <std::three_way_comparable T, sized_random_access_range_of<T> R>
+struct BitSetHelper {
+  // Must contain all the possible values of
+  // the DFA's domain (within reason).
+  const R &universe;
+
+  BitVector all() const { return BitVector(universe.size(), true); }
+
+  BitVector none() const { return BitVector(universe.size(), false); }
 
   // Sets the bit in `bitset` that matches `value`'s position in `universe`
   // to `true`. Does nothing if `value` is not present in `universe`.
-  void set_if_exists(BitVector &bitset, T value) {
-    const auto it = std::ranges::find(universe, value);
-    if (it != universe.cend() && *it == value)
+  bool set_if_exists(BitVector &bitset, T value) {
+    assert(universe.size() == bitset.size() &&
+           "why are the lengths different?");
+    const auto it = r::find(universe, value);
+    if (it != universe.cend() && *it == value) {
       bitset.set(it - universe.cbegin());
+      return true;
+    }
+    return false;
   }
 
   // Performs the meet operator (union) on `in_or_outs`.
-  // `universe_size` tells us how large the final bitvector
-  // should be.
-  BitVector meet_union(const range_of<BitVector> auto in_or_outs) {
+  BitVector
+  meet_union(const sized_random_access_range_of<BitVector> auto in_or_outs) {
     BitVector output(universe.size());
-    for (const auto &first : in_or_outs | std::views::take(1))
+    for (const BitVector &first : in_or_outs | rv::take(1))
       output = first;
-    for (const auto &bv : in_or_outs | std::views::drop(1))
-      output |= bv;
+    for (const BitVector &next : in_or_outs | rv::drop(1))
+      output |= next;
+    assert(universe.size() == output.size() &&
+           "meet operator messes with bitvector length");
     return output;
   }
 
   // Performs the meet operator (intersection) on `in_or_outs`.
-  // `universe_size` tells us how large the final bitvector
-  // should be.
-  BitVector meet_intersect(const range_of<BitVector> auto in_or_outs) {
+  BitVector meet_intersect(
+      const sized_random_access_range_of<BitVector> auto in_or_outs) {
     BitVector output(universe.size());
-    for (const auto &first : in_or_outs | std::views::take(1))
-      output = first;
-    for (const auto &next : in_or_outs | std::views::drop(1))
-      output &= next;
+    if (!in_or_outs.empty())
+      output = in_or_outs[0];
+    for (size_t i = 1; i < in_or_outs.size(); i++)
+      output &= in_or_outs[i];
+    assert(universe.size() == output.size() &&
+           "meet operator messes with bitvector length");
     return output;
+  }
+
+  r::range auto set_values(const BitVector &bitset) {
+    if (bitset.size() != universe.size()) {
+      // return std::views::empty<T>;
+    }
+
+    for (auto x : bitset.set_bits()) {
+    }
+
+    // return std::views::transform(bitset.set_bits(),
+    //            [this](unsigned int idx) { return universe[idx]; });
+    // return std::views::empty<T>;
+  }
+
+  bool is_set(const BitVector &bitset, T value) const {
+    const auto it = r::find(universe, value);
+    if (it != universe.cend() && *it == value)
+      return bitset.test(it - universe.cbegin());
+    return false;
   }
 };
 
 // -------------------- Faint Analysis ---------------------------
 
-struct FaintPass : FunctionPass {
-  static char ID;
-  FaintPass() : FunctionPass(ID) {}
-
+struct FaintAnalysis : public AnalysisInfoMixin<FaintAnalysis> {
+  LLVM_ABI static AnalysisKey Key;
   struct BlockState {
     BitVector in, out;
   };
 
-  // Does LLVM create a new instance of FaintPass
-  // per-function, or does it reuse the same instance?
-  // If so, universe will get clobbered.
-  DenseMap<BasicBlock *, BlockState> st;
+  struct FaintInfo {
+    DenseMap<BasicBlock *, BlockState> st;
+    // LHS variables
+    std::vector<Instruction *> universe;
+  };
+  using Result = FaintInfo;
 
-  // LHS variables
-  // DenseMap<Function *, std::vector<Value *>> universe;
-  std::vector<Value *> universe;
+  struct Helper : BitSetHelper<Instruction *, std::vector<Instruction *>> {
+    // size_t pass_iteration = 1;
 
-  struct Helper : BitSetHelper<Value *, std::vector<Value *>> {
-    BitVector top() { return BitVector(universe.size(), true); }
+    // void increment() {
+    //   pass_iteration++;
+    // }
+
+    BitVector top() const { return all(); }
+    BitVector bottom() const { return none(); }
 
     BitVector gen(Instruction &I) {
-      BitVector gen(universe.size());
-      const auto values = I.operand_values();
-      const bool is_assignment = isa<BinaryOperator>(&I);
-      const bool is_lhs_used_in_def =
-          std::ranges::find(values, &I) != values.end();
-      if (is_assignment && !is_lhs_used_in_def)
-        set_if_exists(gen, dyn_cast<Value>(&I));
+      BitVector gen = bottom();
+      const auto operands = I.operand_values();
+      const bool is_lhs_used_in_def = r::find(operands, &I) != operands.end();
+      if (!is_lhs_used_in_def) {
+        // errs() << "[+] " << pass_iteration << ": ";
+        // if (isa<Function>(I))
+        //   I.printAsOperand(errs(), false);
+        // else
+        //   I.print(errs());
+        // if (set_if_exists(gen, &I))
+        //   errs() << " is faint\n";
+        // else
+        //   errs() << " isn't a variable\n";
+        set_if_exists(gen, &I);
+      }
       return gen;
     }
 
     BitVector const_kill(Instruction &I) {
-      BitVector kill(universe.size());
-      const bool is_assignment = isa<BinaryOperator>(&I);
-      if (is_assignment)
-        for (Value *V : I.operand_values())
-          set_if_exists(kill, V);
+      BitVector kill = bottom();
+      for (Value *V : I.operand_values()) {
+        // errs() << "[-] " << pass_iteration << ": ";
+        // if (isa<Function>(V))
+        //   V->printAsOperand(errs(), false);
+        // else
+        //   V->print(errs());
+        // if (set_if_exists(kill, dyn_cast<Instruction>(V)))
+        //   errs() << " is not faint\n";
+        // else
+        //   errs() << " isn't a LHS variable\n";
+        set_if_exists(kill, dyn_cast<Instruction>(V));
+      }
       return kill;
     }
 
     BitVector dep_kill(Instruction &I, const BitVector &out) {
-      BitVector kill(universe.size());
+      BitVector kill = bottom();
       const BitVector &faint = out;
-      const bool is_assignment = isa<BinaryOperator>(&I);
-      const bool is_lhs_faint = [&]() {
-        const auto it = std::ranges::find(universe, &I);
+      auto is_lhs_faint = [&](Instruction *I) {
+        const auto it = r::find(universe, I);
         if (it != universe.cend()) {
           size_t idx = it - universe.cbegin();
-          return faint.size() > idx && faint[idx];
+          return faint[idx];
         }
         return false;
-      }();
+      };
 
-      if (is_assignment && is_lhs_faint)
-        for (Value *V : I.operand_values())
-          set_if_exists(kill, V);
+      if (!is_lhs_faint(&I))
+        for (Value *V : I.operand_values()) {
+          // errs() << "[-] " << pass_iteration << ": ";
+          // if (isa<Function>(V))
+          //   V->printAsOperand(errs(), false);
+          // else
+          //   V->print(errs());
+          // if (set_if_exists(kill, dyn_cast<Instruction>(V)))
+          //   errs() << " is not faint\n";
+          // else
+          //   errs() << " isn't a LHS variable\n";
+          set_if_exists(kill, dyn_cast<Instruction>(V));
+        }
 
       return kill;
     }
 
     BitVector transfer(Instruction &I, const BitVector &out) {
       BitVector in = out;
-      BitVector _gen = gen(I);
-      BitVector _kill = const_kill(I) |= dep_kill(I, out);
-      return in.reset(_kill) |= _gen;
+      return in.reset(dep_kill(I, out)) |= gen(I);
     }
 
     BitVector transfer(BasicBlock &BB, const BitVector &out) {
       BitVector in = out;
       for (Instruction &I : *BB.getReverseIterator()) {
-        BitVector &out = in;
+        const BitVector &out = in;
         in = transfer(I, out);
       }
       return in;
     }
   };
 
-  bool runOnFunction(Function &F) {
-    auto to_value = [](Instruction &I) { return cast<Value>(&I); };
-    auto lhs = F | std::views::join | std::views::transform(to_value);
-    universe.assign(lhs.begin(), lhs.end()); // Clobbers all prev results
+  Result run(Function &F, FunctionAnalysisManager &FAM) {
+    auto non_void = [](Instruction &I) { return !I.getType()->isVoidTy(); };
+    auto to_ptr = [](Instruction &I) { return &I; };
+    auto lhs = F | rv::join | rv::filter(non_void) | rv::transform(to_ptr);
+    std::vector<Instruction *> universe{lhs.begin(), lhs.end()};
     sort_unique(universe);
 
+    // Reverse direction
     const std::vector<BasicBlock *> order = post_order(F);
     Helper helper{universe};
+
+    // Set up state for all basic blocks
+    DenseMap<BasicBlock *, BlockState> st;
+    for (BasicBlock *BB : order) {
+      st[BB] = std::move(BlockState{helper.top(), helper.top()});
+    }
 
     bool changed = true;
     while (changed) {
@@ -280,11 +367,15 @@ struct FaintPass : FunctionPass {
           st[BB].in = in;
         }
       }
+      // helper.increment();
     }
-    return false;
+
+    // this->info = {st, universe};
+    return {st, universe};
   }
 
-  void getAnalysisUsage(AnalysisUsage &AU) { AU.setPreservesAll(); }
+  // private:
+  //   FaintInfo info;
 };
 
 /**
@@ -299,33 +390,69 @@ struct FaintPass : FunctionPass {
  * Init for internal nodes: OUT[B] = T
  * Transfer: OUT[B] = IN[B] union B
  */
-struct DominatorsPass : FunctionPass {
-  static char ID;
-  DominatorsPass() : FunctionPass(ID) {}
+struct DominatorsPass : PassInfoMixin<DominatorsPass> {
 
   struct BlockState {
     BitVector in, out;
   };
 
   struct Helper : BitSetHelper<BasicBlock *, std::vector<BasicBlock *>> {
-    BitVector top() { return BitVector(universe.size(), true); }
-    BitVector bottom() { return BitVector(universe.size(), false); }
+    BitVector top() const { return all(); }
+    BitVector bottom() const { return none(); }
   };
 
-  bool runOnFunction(Function &F) {
+  struct DominatorInfo {
+    DenseMap<BasicBlock *, BlockState> st;
+    std::vector<BasicBlock *> universe;
+  };
+  using Result = DominatorInfo;
+
+  void print_loop_dominators(Loop *L) {
+    for (BasicBlock *BB : L->getBlocks()) {
+      errs() << getBBName(BB);
+      const auto &dom = info.st[BB].out;
+      if (dom.none()) {
+        errs() << " is dominated by entry\n";
+        continue;
+      }
+      bool is_first = true;
+      errs() << " is dominated by ";
+      for (size_t i = 0; i < dom.size(); ++i) {
+        if (!dom[i])
+          continue;
+        if (is_first) {
+          errs() << getBBName(info.universe[i]);
+          is_first = false;
+        } else
+          errs() << ", " << getBBName(info.universe[i]);
+      }
+      errs() << "\n";
+    }
+
+    for (Loop *sub : L->getSubLoops()) {
+      print_loop_dominators(sub);
+    }
+  }
+
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     outs() << "=== ";
     F.printAsOperand(outs(), false);
     outs() << " ===\n";
 
     auto get_ptr = [](BasicBlock &BB) { return &BB; };
-    auto blocks = F | std::views::transform(get_ptr);
+    auto blocks = F | rv::transform(get_ptr);
     std::vector<BasicBlock *> universe{blocks.begin(), blocks.end()};
     sort_unique(universe);
 
     const std::vector<BasicBlock *> order = r_post_order(F);
     Helper helper{universe};
 
+    // Set up state for all basic blocks
     DenseMap<BasicBlock *, BlockState> st;
+    for (BasicBlock *BB : order) {
+      st[BB] = std::move(BlockState{helper.top(), helper.top()});
+    }
+
     bool changed = true;
     while (changed) {
       changed = false;
@@ -333,6 +460,8 @@ struct DominatorsPass : FunctionPass {
         std::vector<BitVector> predOuts;
         if (BB == &F.getEntryBlock()) {
           BitVector boundary = helper.bottom();
+          assert(boundary.size() > 1 && "The presence of an entry block => "
+                                        "BitVector has at least one bit");
           boundary.set(0); // OUT[B] = {entry}
           predOuts.push_back(boundary);
         }
@@ -342,12 +471,12 @@ struct DominatorsPass : FunctionPass {
           predOuts.push_back(helper.top());
 
         st[BB].in = helper.meet_intersect(predOuts);
+        assert(st[BB].in.size() == helper.universe.size() &&
+               "are meet operators messing with the length?");
 
         // Transfer
         BitVector newOut = st[BB].in;
-        auto it = std::ranges::find(universe, BB);
-        if (it != universe.end() && *it == BB)
-          newOut.set(it - universe.begin());
+        helper.set_if_exists(newOut, BB);
 
         if (newOut != st[BB].out) {
           st[BB].out = newOut;
@@ -356,48 +485,102 @@ struct DominatorsPass : FunctionPass {
       }
     }
 
-    for (BasicBlock *BB : order) {
-      BB->printAsOperand(outs(), false);
-      auto &out = st[BB].out;
-      if (out.empty())
-        outs() << " has no dominators\n";
+    // Set state for result caching
+    this->info = {st, universe};
 
-      outs() << " is dominated by " << universe[0]->getName();
-      for (size_t i = 1; i < out.size(); ++i) {
-        if (!out[i])
-          continue;
-        outs() << ", " << universe[i]->getName();
-      }
-
-      outs() << ".\n";
+    // Print out results for debugging
+    LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+    for (Loop *L : LI) {
+      print_loop_dominators(L);
     }
 
-    return false;
+    return PreservedAnalyses::all();
   }
 
-  void getAnalysisUsage(AnalysisUsage &AU) const { AU.setPreservesAll(); }
+  static bool isRequired() { return true; }
+
+private:
+  DominatorInfo info;
 };
 
-struct DeadCodeEliminationPass : FunctionPass {
-  static char ID;
+struct DeadCodeEliminationPass : PassInfoMixin<DeadCodeEliminationPass> {
+  static bool is_live(const Instruction &I) {
+    return I.isTerminator() || I.mayHaveSideEffects() ||
+           isa<DbgInfoIntrinsic>(I) || isa<LandingPadInst>(I);
+  }
 
-  DeadCodeEliminationPass() : FunctionPass(ID) {}
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    const auto &[state, universe] = FAM.getResult<FaintAnalysis>(F);
 
-  void getAnalysisUsage(AnalysisUsage &AU) const { AU.setPreservesCFG(); }
+    std::vector<Instruction *> to_erase;
+    for (const auto &block : state.values())
+      for (unsigned int i : block.in.set_bits()) {
+        if (!is_live(*universe[i])) {
+          to_erase.push_back(universe[i]);
+        }
+      }
+    sort_unique(to_erase);
 
-  bool runOnFunction(Function &F) { return false; }
+    for (Instruction *I : to_erase) {
+      errs() << "Removing instruction\t" << *I << "\n";
+    }
+
+    bool modified = false;
+    bool erased = true;
+    while (erased) {
+      erased = false;
+      std::vector<Instruction *> remaining;
+      for (Instruction *I : to_erase) {
+        if (I->use_empty()) {
+          I->eraseFromParent();
+          modified = true;
+          erased = true;
+        } else {
+          remaining.push_back(I);
+        }
+      }
+
+      to_erase = std::move(remaining);
+    }
+
+    return modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  }
+
+  static bool isRequired() { return true; }
 };
 
 } // namespace
 
-char DominatorsPass::ID = 0;
-static RegisterPass<DominatorsPass> tmp1("dominators", "Dominators", false,
-                                         true);
+// ============================================================
+// Plugin Registration
+// ============================================================
 
-char FaintPass::ID = 1;
-static RegisterPass<FaintPass> tmp2("faint", "Faint Analysis", false, true);
+AnalysisKey FaintAnalysis::Key = AnalysisKey();
 
-char DeadCodeEliminationPass::ID = 2;
-static RegisterPass<DeadCodeEliminationPass>
-    tmp3("dead-code-elimination", "Dead Code Elimination", false, false);
-
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
+llvmGetPassPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "ECE5544Passes", LLVM_VERSION_STRING,
+          [](PassBuilder &PB) {
+            PB.registerAnalysisRegistrationCallback(
+                [](FunctionAnalysisManager &FAM) {
+                  FAM.registerPass([]() { return FaintAnalysis(); });
+                });
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, FunctionPassManager &FPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                  if (Name == "dominators") {
+                    FPM.addPass(DominatorsPass());
+                    return true;
+                  }
+                  if (Name == "dead-code-elimination") {
+                    FPM.addPass(DeadCodeEliminationPass());
+                    return true;
+                  }
+                  // if (Name == "loop-invariant-code-motion") {
+                  //   FPM.addPass(LICMPass());
+                  //   return true;
+                  // }
+                  return false;
+                });
+          }};
+}
