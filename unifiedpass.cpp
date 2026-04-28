@@ -10,6 +10,7 @@
 #include <llvm/ADT/BitVector.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/Analysis/LoopInfo.h>
+#include <llvm/Analysis/LoopPass.h>
 #include <llvm/IR/Analysis.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/CFG.h>
@@ -26,7 +27,7 @@
 
 using namespace llvm;
 
-namespace {
+namespace p3 {
 namespace r = std::ranges;
 namespace rv = std::ranges::views;
 
@@ -169,9 +170,8 @@ struct BitSetHelper {
 
   // Sets the bit in `bitset` that matches `value`'s position in `universe`
   // to `true`. Does nothing if `value` is not present in `universe`.
+  // Assumptions: bitset.size() == universe.size()
   bool set_if_exists(BitVector &bitset, T value) {
-    assert(universe.size() == bitset.size() &&
-           "why are the lengths different?");
     const auto it = r::find(universe, value);
     if (it != universe.cend() && *it == value) {
       bitset.set(it - universe.cbegin());
@@ -188,8 +188,6 @@ struct BitSetHelper {
       output = first;
     for (const BitVector &next : in_or_outs | rv::drop(1))
       output |= next;
-    assert(universe.size() == output.size() &&
-           "meet operator messes with bitvector length");
     return output;
   }
 
@@ -197,15 +195,14 @@ struct BitSetHelper {
   BitVector meet_intersect(
       const sized_random_access_range_of<BitVector> auto in_or_outs) {
     BitVector output(universe.size());
-    if (!in_or_outs.empty())
-      output = in_or_outs[0];
-    for (size_t i = 1; i < in_or_outs.size(); i++)
-      output &= in_or_outs[i];
-    assert(universe.size() == output.size() &&
-           "meet operator messes with bitvector length");
+    for (const BitVector &first : in_or_outs | rv::take(1))
+      output = first;
+    for (const BitVector &next : in_or_outs | rv::drop(1))
+      output &= next;
     return output;
   }
 
+  // Assumptions: bitset.size() == universe.size()
   r::range auto set_values(const BitVector &bitset) {
     if (bitset.size() != universe.size()) {
       // return std::views::empty<T>;
@@ -219,6 +216,7 @@ struct BitSetHelper {
     // return std::views::empty<T>;
   }
 
+  // Assumptions: bitset.size() == universe.size()
   bool is_set(const BitVector &bitset, T value) const {
     const auto it = r::find(universe, value);
     if (it != universe.cend() && *it == value)
@@ -243,12 +241,6 @@ struct FaintAnalysis : public AnalysisInfoMixin<FaintAnalysis> {
   using Result = FaintInfo;
 
   struct Helper : BitSetHelper<Instruction *, std::vector<Instruction *>> {
-    // size_t pass_iteration = 1;
-
-    // void increment() {
-    //   pass_iteration++;
-    // }
-
     BitVector top() const { return all(); }
     BitVector bottom() const { return none(); }
 
@@ -257,38 +249,12 @@ struct FaintAnalysis : public AnalysisInfoMixin<FaintAnalysis> {
       const auto operands = I.operand_values();
       const bool is_lhs_used_in_def = r::find(operands, &I) != operands.end();
       if (!is_lhs_used_in_def) {
-        // errs() << "[+] " << pass_iteration << ": ";
-        // if (isa<Function>(I))
-        //   I.printAsOperand(errs(), false);
-        // else
-        //   I.print(errs());
-        // if (set_if_exists(gen, &I))
-        //   errs() << " is faint\n";
-        // else
-        //   errs() << " isn't a variable\n";
         set_if_exists(gen, &I);
       }
       return gen;
     }
 
-    BitVector const_kill(Instruction &I) {
-      BitVector kill = bottom();
-      for (Value *V : I.operand_values()) {
-        // errs() << "[-] " << pass_iteration << ": ";
-        // if (isa<Function>(V))
-        //   V->printAsOperand(errs(), false);
-        // else
-        //   V->print(errs());
-        // if (set_if_exists(kill, dyn_cast<Instruction>(V)))
-        //   errs() << " is not faint\n";
-        // else
-        //   errs() << " isn't a LHS variable\n";
-        set_if_exists(kill, dyn_cast<Instruction>(V));
-      }
-      return kill;
-    }
-
-    BitVector dep_kill(Instruction &I, const BitVector &out) {
+    BitVector kill(Instruction &I, const BitVector &out) {
       BitVector kill = bottom();
       const BitVector &faint = out;
       auto is_lhs_faint = [&](Instruction *I) {
@@ -302,15 +268,6 @@ struct FaintAnalysis : public AnalysisInfoMixin<FaintAnalysis> {
 
       if (!is_lhs_faint(&I))
         for (Value *V : I.operand_values()) {
-          // errs() << "[-] " << pass_iteration << ": ";
-          // if (isa<Function>(V))
-          //   V->printAsOperand(errs(), false);
-          // else
-          //   V->print(errs());
-          // if (set_if_exists(kill, dyn_cast<Instruction>(V)))
-          //   errs() << " is not faint\n";
-          // else
-          //   errs() << " isn't a LHS variable\n";
           set_if_exists(kill, dyn_cast<Instruction>(V));
         }
 
@@ -319,7 +276,7 @@ struct FaintAnalysis : public AnalysisInfoMixin<FaintAnalysis> {
 
     BitVector transfer(Instruction &I, const BitVector &out) {
       BitVector in = out;
-      return in.reset(dep_kill(I, out)) |= gen(I);
+      return in.reset(kill(I, out)) |= gen(I);
     }
 
     BitVector transfer(BasicBlock &BB, const BitVector &out) {
@@ -367,15 +324,10 @@ struct FaintAnalysis : public AnalysisInfoMixin<FaintAnalysis> {
           st[BB].in = in;
         }
       }
-      // helper.increment();
     }
 
-    // this->info = {st, universe};
     return {st, universe};
   }
-
-  // private:
-  //   FaintInfo info;
 };
 
 /**
@@ -390,7 +342,8 @@ struct FaintAnalysis : public AnalysisInfoMixin<FaintAnalysis> {
  * Init for internal nodes: OUT[B] = T
  * Transfer: OUT[B] = IN[B] union B
  */
-struct DominatorsPass : PassInfoMixin<DominatorsPass> {
+struct DomAnalysis : AnalysisInfoMixin<DomAnalysis> {
+  LLVM_ABI static AnalysisKey Key;
 
   struct BlockState {
     BitVector in, out;
@@ -401,40 +354,36 @@ struct DominatorsPass : PassInfoMixin<DominatorsPass> {
     BitVector bottom() const { return none(); }
   };
 
-  struct DominatorInfo {
+  struct DomInfo {
     DenseMap<BasicBlock *, BlockState> st;
     std::vector<BasicBlock *> universe;
-  };
-  using Result = DominatorInfo;
 
-  void print_loop_dominators(Loop *L) {
-    for (BasicBlock *BB : L->getBlocks()) {
-      errs() << getBBName(BB);
-      const auto &dom = info.st[BB].out;
-      if (dom.none()) {
-        errs() << " is dominated by entry\n";
-        continue;
-      }
-      bool is_first = true;
-      errs() << " is dominated by ";
-      for (size_t i = 0; i < dom.size(); ++i) {
-        if (!dom[i])
+    void print_loop_dominators(Loop *L) {
+      for (BasicBlock *BB : L->getBlocks()) {
+        errs() << getBBName(BB);
+        const auto &dom = st[BB].out;
+        if (dom.none()) {
+          errs() << " is dominated by entry\n";
           continue;
-        if (is_first) {
-          errs() << getBBName(info.universe[i]);
-          is_first = false;
-        } else
-          errs() << ", " << getBBName(info.universe[i]);
+        }
+        bool is_first = true;
+        errs() << " is dominated by ";
+        for (size_t i = 0; i < dom.size(); ++i) {
+          if (!dom[i])
+            continue;
+          if (is_first) {
+            errs() << getBBName(universe[i]);
+            is_first = false;
+          } else
+            errs() << ", " << getBBName(universe[i]);
+        }
+        errs() << "\n";
       }
-      errs() << "\n";
     }
+  };
+  using Result = DomInfo;
 
-    for (Loop *sub : L->getSubLoops()) {
-      print_loop_dominators(sub);
-    }
-  }
-
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+  Result run(Function &F, FunctionAnalysisManager &FAM) {
     outs() << "=== ";
     F.printAsOperand(outs(), false);
     outs() << " ===\n";
@@ -471,8 +420,6 @@ struct DominatorsPass : PassInfoMixin<DominatorsPass> {
           predOuts.push_back(helper.top());
 
         st[BB].in = helper.meet_intersect(predOuts);
-        assert(st[BB].in.size() == helper.universe.size() &&
-               "are meet operators messing with the length?");
 
         // Transfer
         BitVector newOut = st[BB].in;
@@ -485,25 +432,29 @@ struct DominatorsPass : PassInfoMixin<DominatorsPass> {
       }
     }
 
-    // Set state for result caching
-    this->info = {st, universe};
+    return {st, universe};
+  }
+};
 
-    // Print out results for debugging
+struct PrintDominatorsPass : PassInfoMixin<PrintDominatorsPass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    DomAnalysis::DomInfo &DI = FAM.getResult<DomAnalysis>(F);
     LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+
     for (Loop *L : LI) {
-      print_loop_dominators(L);
+      DI.print_loop_dominators(L);
+      for (Loop *sub : L->getSubLoops()) {
+        DI.print_loop_dominators(sub);
+      }
     }
 
     return PreservedAnalyses::all();
   }
 
   static bool isRequired() { return true; }
-
-private:
-  DominatorInfo info;
 };
 
-struct DeadCodeEliminationPass : PassInfoMixin<DeadCodeEliminationPass> {
+struct DCEPass : PassInfoMixin<DCEPass> {
   static bool is_live(const Instruction &I) {
     return I.isTerminator() || I.mayHaveSideEffects() ||
            isa<DbgInfoIntrinsic>(I) || isa<LandingPadInst>(I);
@@ -549,13 +500,33 @@ struct DeadCodeEliminationPass : PassInfoMixin<DeadCodeEliminationPass> {
   static bool isRequired() { return true; }
 };
 
-} // namespace
+struct LICMPass : LoopPass {
+  bool runOnLoop(Loop *L, LPPassManager &LPM) {
+    LPM.getAnalysis<DomAnalysis>();
+
+    return false;
+  }
+};
+
+struct PrintLICMPass : PassInfoMixin<PrintLICMPass> {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    auto &LI = FAM.getResult<LoopAnalysis>(F);
+    auto &DI = FAM.getResult<DomAnalysis>(F);
+
+    return PreservedAnalyses{}.preserve<LoopAnalysis>();
+  }
+
+  static bool isRequired() { return true; }
+};
+
+} // namespace p3
 
 // ============================================================
 // Plugin Registration
 // ============================================================
 
-AnalysisKey FaintAnalysis::Key = AnalysisKey();
+AnalysisKey p3::FaintAnalysis::Key;
+AnalysisKey p3::DomAnalysis::Key;
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
@@ -563,23 +534,24 @@ llvmGetPassPluginInfo() {
           [](PassBuilder &PB) {
             PB.registerAnalysisRegistrationCallback(
                 [](FunctionAnalysisManager &FAM) {
-                  FAM.registerPass([]() { return FaintAnalysis(); });
+                  FAM.registerPass([]() { return p3::FaintAnalysis(); });
+                  FAM.registerPass([]() { return p3::DomAnalysis(); });
                 });
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
                   if (Name == "dominators") {
-                    FPM.addPass(DominatorsPass());
+                    FPM.addPass(p3::PrintDominatorsPass());
                     return true;
                   }
                   if (Name == "dead-code-elimination") {
-                    FPM.addPass(DeadCodeEliminationPass());
+                    FPM.addPass(p3::DCEPass());
                     return true;
                   }
-                  // if (Name == "loop-invariant-code-motion") {
-                  //   FPM.addPass(LICMPass());
-                  //   return true;
-                  // }
+                  if (Name == "loop-invariant-code-motion") {
+                    FPM.addPass(p3::PrintLICMPass());
+                    return true;
+                  }
                   return false;
                 });
           }};
